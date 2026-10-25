@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 """X投稿 半自動化ツール（標準ライブラリのみ）
 
-使い方（x-posting/ で実行）:
-  python3 tools/x_tool.py validate --brand manabiya-project 週次/2026-W44.md
-  python3 tools/x_tool.py export   --brand manabiya-project 週次/2026-W44.md
-  python3 tools/x_tool.py channels                                   # BufferのチャンネルIDを確認
-  python3 tools/x_tool.py push     --brand manabiya-project 週次/2026-W44.md --dry-run
-  python3 tools/x_tool.py push     --brand manabiya-project 週次/2026-W44.md [--schedule]
+使い方（x-posting/ で実行。W=週次/2026-W44.md）:
+  python3 tools/x_tool.py check    --brand manabiya-project          # 接続確認と投稿先 @manabiyapro の確認
+  python3 tools/x_tool.py posts    --brand manabiya-project          # Bufferの予約・下書き一覧
+  python3 tools/x_tool.py validate --brand manabiya-project $W       # 投稿案のチェック
+  python3 tools/x_tool.py review   --brand manabiya-project $W       # 承認用の一覧
+  python3 tools/x_tool.py approve  --brand manabiya-project $W 2026W44-1 ...
+  python3 tools/x_tool.py push     --brand manabiya-project $W --mode schedule --dry-run
+  python3 tools/x_tool.py push     --brand manabiya-project $W --mode schedule
+  python3 tools/x_tool.py results  --brand manabiya-project          # 登録結果の一覧
+  python3 tools/x_tool.py export   --brand manabiya-project $W       # API を使わずコピペ用に書き出す
   python3 tools/x_tool.py report   --brand manabiya-project
 
 安全のための約束:
-  - Bufferに送るのは status が「承認」の投稿だけ。validate でエラーがある週は送らない。
-  - 既定ではBufferに「下書き」として登録する。--schedule を付けたときだけ予約投稿にする。
-  - 送信済みの投稿は「登録済」に書き換え、二重登録しない。
-  - Bufferのパスワードは使わない。APIキーは環境変数 BUFFER_API_KEY で渡す。
+  - Bufferに送るのは approve で承認した投稿だけ。承認後に本文が変わったら、承認し直すまで送らない。
+  - 送る前に毎回、投稿先が buffer.json の expected_handle（@manabiyapro）のXチャンネルであることを確認する。
+  - 登録記録.csv と Buffer上の予約・下書きを照合し、同じ投稿を二重に登録しない。
+  - Bufferのパスワードは使わない。APIキーは環境変数 BUFFER_API_KEY で渡し、ファイルに保存しない。
 """
 
 import argparse
 import csv
 import datetime as dt
+import hashlib
 import json
 import os
 import re
 import sys
+import urllib.error
 import urllib.request
 from collections import Counter, defaultdict
 from pathlib import Path
@@ -37,21 +43,26 @@ KINDS = ("情報提供", "note紹介")
 RISKY = ["必ず合格", "絶対", "100%", "１００％", "確実に", "誰でも", "簡単に合格", "最短で合格",
          "合格率", "裏ワザ", "知らないと損", "人生が変わる", "爆速", "圧倒的"]
 
-# Buffer GraphQL（developers.buffer.com の Posts & Scheduling ガイドに基づく）。
-# 最初の実行で応答を確認し、スキーマ差異があればここだけ直す。
-CREATE_POST = """
-mutation CreatePost($input: CreatePostInput!) {
-  createPost(input: $input) {
+# Buffer GraphQL（developers.buffer.com の Your First Post / Get Channels / Get Posts For Channels /
+# Posts & Scheduling / Create Draft Post に基づく）。入力型の名前に依存しないよう、値はクエリに直接埋め込む。
+GET_ORGS = "query GetOrganizations { account { organizations { id name } } }"
+GET_CHANNELS = """query GetChannels {
+  channels(input: { organizationId: %s }) { id name displayName service descriptor isQueuePaused }
+}"""
+GET_POSTS = """query GetPosts {
+  posts(first: %d, input: { organizationId: %s, filter: { status: [%s], channelIds: [%s] } }) {
+    edges { node { id status dueAt text } }
+  }
+}"""
+CREATE_POST = """mutation CreatePost {
+  createPost(input: { text: %s, channelId: %s, schedulingType: automatic, mode: customScheduled,
+                      dueAt: %s, saveToDraft: %s }) {
     ... on PostActionSuccess { post { id status dueAt } }
     ... on MutationError { message }
   }
 }"""
-LIST_CHANNELS = """
-query {
-  account {
-    organizations { id name channels { id name service } }
-  }
-}"""
+X_SERVICES = ("twitter", "x")
+LEDGER_FIELDS = ["登録日時", "投稿ID", "予定日時(JST)", "登録モード", "Buffer投稿ID", "Bufferの状態", "本文ハッシュ", "本文"]
 
 
 # ---------------------------------------------------------------- 週次ファイル
@@ -247,26 +258,164 @@ def cmd_export(args):
     print("Bufferの画面で、各投稿を表示の日時で予約してください。予約したら status を「登録済」に変えてください。")
 
 
-def buffer_call(query, variables=None):
-    key = os.environ.get("BUFFER_API_KEY")
+def gql(s):
+    """Python の文字列を GraphQL の文字列リテラルにする（JSON のエスケープと互換）"""
+    return json.dumps(s, ensure_ascii=False)
+
+
+def buffer_call(query):
+    key = os.environ.get("BUFFER_API_KEY", "").strip()
     if not key:
-        sys.exit("環境変数 BUFFER_API_KEY が設定されていません（BufferのAPIキーを設定してください）")
+        sys.exit("環境変数 BUFFER_API_KEY が設定されていません。README の「APIキーの設定」を見てください。")
     req = urllib.request.Request(
         BUFFER_ENDPOINT,
-        data=json.dumps({"query": query, "variables": variables or {}}).encode(),
+        data=json.dumps({"query": query}).encode(),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
     )
-    with urllib.request.urlopen(req, timeout=30) as res:
-        body = json.loads(res.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=30) as res:
+            body = json.loads(res.read().decode())
+    except urllib.error.HTTPError as e:
+        hint = {401: "APIキーが無効か期限切れです", 403: "権限がないか、ネットワークで遮断されています",
+                429: "リクエスト数の上限に達しました。時間をおいてください"}.get(e.code, "")
+        sys.exit(f"Buffer API エラー: HTTP {e.code} {hint}\n{e.read().decode(errors='replace')[:500]}")
+    except urllib.error.URLError as e:
+        sys.exit(f"Buffer API に接続できません: {e.reason}\n"
+                 "（クラウド環境の場合、Network access の許可ドメインに api.buffer.com が必要です）")
     if body.get("errors"):
-        raise RuntimeError(json.dumps(body["errors"], ensure_ascii=False))
+        sys.exit("Buffer API がエラーを返しました:\n" + json.dumps(body["errors"], ensure_ascii=False, indent=2))
     return body["data"]
 
 
-def cmd_channels(args):
-    data = buffer_call(LIST_CHANNELS)
-    print(json.dumps(data, ensure_ascii=False, indent=2))
-    print("\nXのチャンネルの id を brands/<ブランド>/buffer.json の channel_id に書いてください。")
+def norm_handle(s):
+    return (s or "").strip().lstrip("@").lower()
+
+
+def load_buffer_conf(bdir):
+    p = bdir / "buffer.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def verify_channel(bdir):
+    """buffer.json の expected_handle と一致するXチャンネルを1つだけ特定する。結果は buffer.json に保存"""
+    conf = load_buffer_conf(bdir)
+    want = norm_handle(conf.get("expected_handle"))
+    if not want:
+        sys.exit("buffer.json に expected_handle（投稿先のXアカウント名）がありません。")
+    orgs = buffer_call(GET_ORGS)["account"]["organizations"]
+    found, all_channels = [], []
+    for org in orgs:
+        for ch in buffer_call(GET_CHANNELS % gql(org["id"]))["channels"]:
+            all_channels.append((org, ch))
+            names = {norm_handle(ch.get("name")), norm_handle(ch.get("displayName"))}
+            if str(ch.get("service", "")).lower() in X_SERVICES and want in names:
+                found.append((org, ch))
+    print("Bufferに連携されているチャンネル:")
+    for org, ch in all_channels:
+        mark = "→" if (org, ch) in found else " "
+        print(f" {mark} [{ch.get('service')}] name={ch.get('name')} displayName={ch.get('displayName')} "
+              f"id={ch['id']}{'（キュー停止中）' if ch.get('isQueuePaused') else ''}")
+    if not all_channels:
+        sys.exit("\nチャンネルが1つもありません。BufferでXアカウントを連携してください。")
+    if len(found) != 1:
+        sys.exit(f"\n投稿先「@{want}」のXチャンネルを{'特定できません（複数一致）' if found else '見つけられません'}。"
+                 "安全のため、ここで止めます。")
+    org, ch = found[0]
+    if conf.get("channel_id") and conf["channel_id"] != ch["id"]:
+        sys.exit(f"\nbuffer.json の channel_id（{conf['channel_id']}）と、実際のチャンネル（{ch['id']}）が違います。"
+                 "連携し直した可能性があります。確認のうえ buffer.json の channel_id を空にして再実行してください。")
+    conf.update(organization_id=org["id"], channel_id=ch["id"], verified_at=dt.datetime.now(JST).isoformat(timespec="seconds"))
+    (bdir / "buffer.json").write_text(json.dumps(conf, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(f"\nOK 投稿先は X の @{want} です（channel_id={ch['id']}）。")
+    return conf
+
+
+def fetch_posts(conf, statuses, first=50):
+    q = GET_POSTS % (first, gql(conf["organization_id"]), ", ".join(statuses), gql(conf["channel_id"]))
+    return [e["node"] for e in buffer_call(q)["posts"]["edges"]]
+
+
+def cmd_check(args):
+    """接続確認：APIキー → 組織 → チャンネル → 投稿先 @アカウント の確認"""
+    verify_channel(brand_dir(args.brand))
+
+
+def cmd_posts(args):
+    bdir = brand_dir(args.brand)
+    conf = verify_channel(bdir)
+    statuses = args.status.split(",")
+    rows = fetch_posts(conf, statuses)
+    rows.sort(key=lambda n: n.get("dueAt") or "")
+    print(f"\nBufferの投稿一覧（状態: {', '.join(statuses)}）: {len(rows)}件")
+    for n in rows:
+        due = n.get("dueAt")
+        jst = dt.datetime.fromisoformat(due.replace("Z", "+00:00")).astimezone(JST).strftime("%m/%d %H:%M") if due else "日時なし"
+        text = re.sub(r"\s+", " ", n.get("text") or "")
+        print(f"  {jst}  [{n.get('status')}]  {text[:50]}{'…' if len(text) > 50 else ''}  (id={n['id']})")
+
+
+def text_hash(text):
+    return hashlib.sha256(text.strip().encode()).hexdigest()[:12]
+
+
+def load_ledger(bdir):
+    p = bdir / "登録記録.csv"
+    if not p.exists():
+        return []
+    with p.open(encoding="utf-8-sig") as f:
+        return list(csv.DictReader(f))
+
+
+def append_ledger(bdir, row):
+    p = bdir / "登録記録.csv"
+    new = not p.exists()
+    with p.open("a", encoding="utf-8-sig" if new else "utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=LEDGER_FIELDS)
+        if new:
+            w.writeheader()
+        w.writerow(row)
+
+
+def cmd_review(args):
+    """承認用の一覧（日時・状態・本文）を表示する"""
+    bdir = brand_dir(args.brand)
+    posts = parse_week(bdir / args.week)
+    errors, warns = check(bdir, posts)
+    for p in sorted(posts, key=lambda p: p.get("datetime", "")):
+        pid = p.get("id", "?")
+        state = p.get("status")
+        if state == "承認" and p.get("approved_hash") != text_hash(p["text"]):
+            state = "承認（※承認後に本文が変わっています）"
+        print("=" * 60)
+        print(f"{pid}　{p.get('datetime')}（日本時間）　{p.get('kind')}　状態: {state}")
+        print("-" * 60)
+        print(p["text"])
+        for m in errors.get(pid, []):
+            print(f"  ⚠ エラー: {m}")
+        for m in warns.get(pid, []):
+            print(f"  △ 注意: {m}")
+    print("=" * 60)
+    print("承認するには: python3 tools/x_tool.py approve --brand", args.brand, args.week, "<投稿ID> ...")
+
+
+def cmd_approve(args):
+    """指定した投稿を承認する。承認時点の本文のハッシュを記録し、以後本文が変わったら承認は無効になる"""
+    bdir = brand_dir(args.brand)
+    path = bdir / args.week
+    posts = {p.get("id"): p for p in parse_week(path)}
+    errors, _ = check(bdir, list(posts.values()))
+    for pid in args.ids:
+        p = posts.get(pid)
+        if not p:
+            print(f"NG {pid}: その投稿IDはありません")
+        elif p.get("status") == "登録済":
+            print(f"NG {pid}: すでにBufferに登録済みです")
+        elif errors.get(pid):
+            print(f"NG {pid}: エラーがあるため承認できません（{'; '.join(errors[pid])}）")
+        else:
+            set_fields(path, pid, status="承認", approved_hash=text_hash(p["text"]),
+                       approved_at=dt.datetime.now(JST).strftime("%Y-%m-%d %H:%M"))
+            print(f"OK {pid} を承認しました")
 
 
 def cmd_push(args):
@@ -276,34 +425,70 @@ def cmd_push(args):
     errors, _ = check(bdir, posts)
     if any(errors.values()):
         sys.exit("validate でエラーがあるため送信しません。先に修正してください。")
-    targets = sorted(approved(posts), key=lambda p: p["datetime"])
+    targets = []
+    for p in sorted(approved(posts), key=lambda p: p["datetime"]):
+        if p.get("approved_hash") != text_hash(p["text"]):
+            sys.exit(f"{p['id']} は承認後に本文が変わっています（または approve コマンドで承認されていません）。"
+                     "review で確認し、approve で承認し直してください。")
+        targets.append(p)
+    if args.only:
+        targets = [p for p in targets if p["id"] in args.only]
     if not targets:
-        sys.exit("送信対象（status: 承認）の投稿がありません。")
-    if args.limit:
-        targets = targets[: args.limit]
-    conf_path = bdir / "buffer.json"
-    channel = json.loads(conf_path.read_text(encoding="utf-8")).get("channel_id") if conf_path.exists() else ""
-    if not channel and not args.dry_run:
-        sys.exit(f"{conf_path.relative_to(ROOT)} に channel_id がありません。先に channels で確認してください。")
-    mode = "予約" if args.schedule else "下書き"
-    print(f"Bufferへ{mode}として {len(targets)}本を登録します{'（dry-run：送信しません）' if args.dry_run else ''}\n")
+        sys.exit("送信対象（approve で承認済み）の投稿がありません。")
+
+    ledger = load_ledger(bdir)
+    done_ids = {r["投稿ID"] for r in ledger}
+    done_hashes = {r["本文ハッシュ"] for r in ledger}
+    skipped = [p for p in targets if p["id"] in done_ids or text_hash(p["text"]) in done_hashes]
+    targets = [p for p in targets if p not in skipped]
+    for p in skipped:
+        print(f"スキップ {p['id']}: 登録記録.csv にすでに登録があります（重複登録の防止）")
+    if not targets:
+        print("新しく登録する投稿はありません。")
+        return
+
+    draft = args.mode == "draft"
+    label = "下書き" if draft else "予約投稿"
+    if args.dry_run:
+        print(f"\n[dry-run] Bufferへ{label}として登録する予定の投稿: {len(targets)}本（送信しません）")
+        for p in targets:
+            print(f"  {p['datetime']} JST  {p['id']}  {re.sub(chr(10), ' ', p['text'])[:40]}…")
+        return
+
+    conf = verify_channel(bdir)  # 毎回、投稿先が @expected_handle であることを確認する
+    existing = {text_hash(n.get("text") or "") for n in fetch_posts(conf, ["scheduled", "draft"], 100)}
+    results = []
     for p in targets:
-        due = parse_when(p).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-        payload = {"text": p["text"], "channelId": channel or "(未設定)", "schedulingType": "automatic",
-                   "mode": "customScheduled", "dueAt": due, "saveToDraft": not args.schedule}
-        if args.dry_run:
-            print(f"--- {p['id']} {p['datetime']} JST\n{json.dumps(payload, ensure_ascii=False, indent=2)}\n")
+        h = text_hash(p["text"])
+        if h in existing:
+            results.append((p, "スキップ", "Bufferに同じ本文の投稿がすでにあります"))
             continue
-        try:
-            res = buffer_call(CREATE_POST, {"input": payload})["createPost"]
-        except Exception as e:
-            print(f"NG {p['id']}: {e}\n残りの送信を中止しました。")
-            break
+        due = parse_when(p).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        q = CREATE_POST % (gql(p["text"]), gql(conf["channel_id"]), gql(due), "true" if draft else "false")
+        res = buffer_call(q)["createPost"]
         if res.get("message") or not res.get("post"):
-            print(f"NG {p['id']}: {res.get('message') or res}\n残りの送信を中止しました。")
+            results.append((p, "失敗", res.get("message") or json.dumps(res, ensure_ascii=False)))
+            print("失敗したため、残りの送信を中止します。")
             break
-        set_fields(path, p["id"], status="登録済", buffer_id=res["post"]["id"], buffer_mode=mode)
-        print(f"OK {p['id']} → Buffer {res['post']['id']}（{mode}）")
+        post = res["post"]
+        set_fields(path, p["id"], status="登録済", buffer_id=post["id"], buffer_mode=label)
+        append_ledger(bdir, {"登録日時": dt.datetime.now(JST).strftime("%Y-%m-%d %H:%M"), "投稿ID": p["id"],
+                             "予定日時(JST)": p["datetime"], "登録モード": label, "Buffer投稿ID": post["id"],
+                             "Bufferの状態": post.get("status", ""), "本文ハッシュ": h, "本文": p["text"]})
+        existing.add(h)
+        results.append((p, "成功", f"Buffer id={post['id']} 状態={post.get('status')}"))
+    print(f"\n登録結果（{label}）")
+    for p, r, d in results:
+        print(f"  [{r}] {p['datetime']} JST  {p['id']}  {d}")
+    print("\n全登録履歴: python3 tools/x_tool.py results --brand", args.brand)
+
+
+def cmd_results(args):
+    rows = load_ledger(brand_dir(args.brand))
+    if not rows:
+        print("まだBufferに登録した投稿はありません。")
+    for r in rows:
+        print(f"{r['登録日時']} 登録 / 予定 {r['予定日時(JST)']} / {r['投稿ID']} / {r['登録モード']} / {r['Buffer投稿ID']} / {r['Bufferの状態']}")
 
 
 def cmd_report(args):
@@ -365,21 +550,27 @@ def cmd_report(args):
 def main():
     ap = argparse.ArgumentParser(description="X投稿 半自動化ツール")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("validate", "export", "push"):
+    for name in ("validate", "review", "approve", "export", "push"):
         p = sub.add_parser(name)
         p.add_argument("--brand", required=True)
         p.add_argument("week", help="ブランドフォルダからの相対パス（例: 週次/2026-W44.md）")
+        if name == "approve":
+            p.add_argument("ids", nargs="+", help="承認する投稿ID（例: 2026W44-1 2026W44-3）")
         if name == "push":
-            p.add_argument("--dry-run", action="store_true", help="送信内容を表示するだけ")
-            p.add_argument("--schedule", action="store_true", help="下書きではなく予約投稿として登録する")
-            p.add_argument("--limit", type=int, default=0, help="送信する最大本数（最初の確認は 1 を推奨）")
-    sub.add_parser("channels")
-    p = sub.add_parser("report")
-    p.add_argument("--brand", required=True)
+            p.add_argument("--mode", required=True, choices=("schedule", "draft"),
+                           help="schedule=予約投稿 / draft=Bufferの下書き（必ずどちらかを指定）")
+            p.add_argument("--only", nargs="+", help="送信する投稿IDを限定する")
+            p.add_argument("--dry-run", action="store_true", help="送信せず、送る予定の投稿を表示するだけ")
+    for name in ("check", "posts", "results", "report"):
+        p = sub.add_parser(name)
+        p.add_argument("--brand", required=True)
+        if name == "posts":
+            p.add_argument("--status", default="scheduled,draft", help="カンマ区切り（scheduled, draft, sent など）")
     args = ap.parse_args()
     if args.cmd == "validate":
         sys.exit(1 if cmd_validate(args) else 0)
-    {"export": cmd_export, "channels": cmd_channels, "push": cmd_push, "report": cmd_report}[args.cmd](args)
+    {"review": cmd_review, "approve": cmd_approve, "export": cmd_export, "check": cmd_check, "posts": cmd_posts,
+     "push": cmd_push, "results": cmd_results, "report": cmd_report}[args.cmd](args)
 
 
 if __name__ == "__main__":
