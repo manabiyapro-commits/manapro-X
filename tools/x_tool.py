@@ -135,11 +135,13 @@ def similarity(a, b):
 
 
 def load_history(bdir):
-    p = bdir / "投稿履歴.csv"
-    if not p.exists():
-        return []
-    with p.open(encoding="utf-8-sig") as f:
-        return list(csv.DictReader(f))
+    """投稿履歴.csv と、history で取得した 分析/過去投稿.csv の両方を、重複チェックの対象にする"""
+    rows = []
+    for p, date_col in ((bdir / "投稿履歴.csv", "投稿日時"), (bdir / "分析" / "過去投稿.csv", "投稿日時(JST)")):
+        if p.exists():
+            with p.open(encoding="utf-8-sig") as f:
+                rows += [{"本文": r.get("本文", ""), "投稿日時": r.get(date_col, "")} for r in csv.DictReader(f)]
+    return rows
 
 
 def load_paid_urls(bdir):
@@ -483,6 +485,46 @@ def cmd_push(args):
     print("\n全登録履歴: python3 tools/x_tool.py results --brand", args.brand)
 
 
+GET_SENT = """query GetSent {
+  posts(first: 100%s, input: { organizationId: %s, filter: { status: [sent], channelIds: [%s] } }) {
+    edges { node { id text sentAt dueAt via externalLink metrics { type value } metricsUpdatedAt } }
+    pageInfo { hasNextPage endCursor }
+  }
+}"""
+METRIC_COLS = [("impressions", "表示回数"), ("reactions", "いいね"), ("reposts", "リポスト"),
+               ("comments", "返信"), ("clicks", "クリック"), ("engagementRate", "エンゲージメント率(%)")]
+
+
+def cmd_history(args):
+    """Bufferから投稿済みのXの投稿と指標を取得し、分析/過去投稿.csv に保存する（読み取りのみ）"""
+    bdir = brand_dir(args.brand)
+    conf = verify_channel(bdir)
+    posts, after = [], None
+    for _ in range(args.max_pages):
+        page = buffer_call(GET_SENT % (f", after: {gql(after)}" if after else "",
+                                      gql(conf["organization_id"]), gql(conf["channel_id"])))["posts"]
+        posts += [e["node"] for e in page["edges"]]
+        if not page["pageInfo"]["hasNextPage"]:
+            break
+        after = page["pageInfo"]["endCursor"]
+    out = bdir / "分析" / "過去投稿.csv"
+    out.parent.mkdir(exist_ok=True)
+    rows = []
+    for p in posts:
+        m = {x["type"]: x["value"] for x in p.get("metrics") or []}
+        when = dt.datetime.fromisoformat((p.get("sentAt") or p["dueAt"]).replace("Z", "+00:00")).astimezone(JST)
+        rows.append([when.strftime("%Y-%m-%d %H:%M"), *[m.get(k, "") for k, _ in METRIC_COLS],
+                     "Buffer" if p.get("via") == "buffer" else "X直接", p.get("externalLink") or "",
+                     (p.get("metricsUpdatedAt") or "")[:10], p["text"]])
+    rows.sort()
+    with out.open("w", encoding="utf-8-sig", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["投稿日時(JST)", *[n for _, n in METRIC_COLS], "投稿元", "URL", "指標の更新日", "本文"])
+        w.writerows(rows)
+    print(f"\n{len(rows)}件を {out.relative_to(ROOT)} に保存しました"
+          + (f"（{rows[0][0][:10]}〜{rows[-1][0][:10]}）" if rows else ""))
+
+
 def cmd_results(args):
     rows = load_ledger(brand_dir(args.brand))
     if not rows:
@@ -561,16 +603,18 @@ def main():
                            help="schedule=予約投稿 / draft=Bufferの下書き（必ずどちらかを指定）")
             p.add_argument("--only", nargs="+", help="送信する投稿IDを限定する")
             p.add_argument("--dry-run", action="store_true", help="送信せず、送る予定の投稿を表示するだけ")
-    for name in ("check", "posts", "results", "report"):
+    for name in ("check", "posts", "history", "results", "report"):
         p = sub.add_parser(name)
         p.add_argument("--brand", required=True)
         if name == "posts":
             p.add_argument("--status", default="scheduled,draft", help="カンマ区切り（scheduled, draft, sent など）")
+        if name == "history":
+            p.add_argument("--max-pages", type=int, default=10, help="取得する最大ページ数（1ページ100件）")
     args = ap.parse_args()
     if args.cmd == "validate":
         sys.exit(1 if cmd_validate(args) else 0)
     {"review": cmd_review, "approve": cmd_approve, "export": cmd_export, "check": cmd_check, "posts": cmd_posts,
-     "push": cmd_push, "results": cmd_results, "report": cmd_report}[args.cmd](args)
+     "history": cmd_history, "push": cmd_push, "results": cmd_results, "report": cmd_report}[args.cmd](args)
 
 
 if __name__ == "__main__":
