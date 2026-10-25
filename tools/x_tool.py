@@ -158,12 +158,25 @@ def parse_when(p):
         return None
 
 
+def load_schedule(bdir):
+    """投稿枠の設定（brands/<ブランド>/schedule.json）。なければ時刻のチェックはしない"""
+    p = bdir / "schedule.json"
+    return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+
+
+def is_past(p, margin_minutes):
+    when = parse_when(p)
+    return when is not None and when < dt.datetime.now(JST) + dt.timedelta(minutes=margin_minutes)
+
+
 def check(bdir, posts):
     """(errors, warnings) を投稿IDごとに返す"""
     errors, warns = defaultdict(list), defaultdict(list)
     history = load_history(bdir)
     paid = load_paid_urls(bdir)
-    now = dt.datetime.now(JST)
+    sched = load_schedule(bdir)
+    slots = sched.get("slots", {})  # {"07:30": "朝", "20:00": "夜"}
+    margin = sched.get("past_margin_minutes", 15)
     seen_ids = Counter(p.get("id") for p in posts)
     for p in posts:
         pid = p.get("id") or f"(行{p['line']})"
@@ -181,8 +194,16 @@ def check(bdir, posts):
         when = parse_when(p)
         if not when:
             e.append("datetime は「YYYY-MM-DD HH:MM」（日本時間）で書いてください")
-        elif when < now and p.get("status") in ("未承認", "承認"):
-            e.append("予定日時が過去になっています")
+        else:
+            if is_past(p, margin) and p.get("status") == "未承認":
+                e.append(f"予定日時が過去（または{margin}分以内）です。日時を直してください")
+            elif is_past(p, margin) and p.get("status") == "承認":
+                w.append(f"予定日時が過去（または{margin}分以内）のため、Bufferには登録されません")
+            hhmm = when.strftime("%H:%M")
+            if slots and hhmm not in slots:
+                e.append(f"投稿時刻 {hhmm} は投稿枠（{'・'.join(slots)}）にありません")
+            elif slots and p.get("kind") in sched.get("night_only_kinds", []) and slots.get(hhmm) != "夜":
+                w.append(f"{p.get('kind')} は夜の枠に入れる方針です")
         text = p["text"]
         if not text:
             e.append("本文が空です")
@@ -212,6 +233,10 @@ def check(bdir, posts):
             s = similarity(a["text"], b["text"])
             if s >= 0.5:
                 errors[a.get("id", "?")].append(f"{b.get('id')} と内容がほぼ同じです（類似度 {s:.2f}）")
+    slot_use = Counter(p.get("datetime") for p in live)
+    for p in live:
+        if slot_use[p.get("datetime")] > 1:
+            errors[p.get("id", "?")].append(f"同じ日時（{p.get('datetime')}）に複数の投稿があります")
     kinds = Counter(p.get("kind") for p in posts if p.get("status") != "却下")
     total = sum(kinds.values())
     if total and kinds["note紹介"] / total > 0.4:
@@ -362,6 +387,11 @@ def text_hash(text):
     return hashlib.sha256(text.strip().encode()).hexdigest()[:12]
 
 
+def approval_hash(p):
+    """承認の対象は「投稿日時＋本文」。どちらかが変わったら承認は無効になる"""
+    return text_hash(f"{p.get('datetime', '')}\n{p['text']}")
+
+
 def load_ledger(bdir):
     p = bdir / "登録記録.csv"
     if not p.exists():
@@ -388,8 +418,8 @@ def cmd_review(args):
     for p in sorted(posts, key=lambda p: p.get("datetime", "")):
         pid = p.get("id", "?")
         state = p.get("status")
-        if state == "承認" and p.get("approved_hash") != text_hash(p["text"]):
-            state = "承認（※承認後に本文が変わっています）"
+        if state == "承認" and p.get("approved_hash") != approval_hash(p):
+            state = "承認が無効（※承認後に日時または本文が変わっています。再承認が必要です）"
         print("=" * 60)
         print(f"{pid}　{p.get('datetime')}（日本時間）　{p.get('kind')}　状態: {state}")
         print("-" * 60)
@@ -403,7 +433,7 @@ def cmd_review(args):
 
 
 def cmd_approve(args):
-    """指定した投稿を承認する。承認時点の本文のハッシュを記録し、以後本文が変わったら承認は無効になる"""
+    """指定した投稿を承認する。承認時点の「日時＋本文」のハッシュを記録し、以後どちらかが変わったら承認は無効になる"""
     bdir = brand_dir(args.brand)
     path = bdir / args.week
     posts = {p.get("id"): p for p in parse_week(path)}
@@ -417,53 +447,83 @@ def cmd_approve(args):
         elif errors.get(pid):
             print(f"NG {pid}: エラーがあるため承認できません（{'; '.join(errors[pid])}）")
         else:
-            set_fields(path, pid, status="承認", approved_hash=text_hash(p["text"]),
+            set_fields(path, pid, status="承認", approved_hash=approval_hash(p),
                        approved_at=dt.datetime.now(JST).strftime("%Y-%m-%d %H:%M"))
             print(f"OK {pid} を承認しました")
 
 
+GET_LIMITS = "query GetLimits { account { organizations { id limits { scheduledPosts } } } }"
+GET_QUEUE = """query GetQueue {
+  posts(first: 100, input: { organizationId: %s, filter: { status: [scheduled, draft] } }) {
+    edges { node { id status dueAt text channelId } }
+  }
+}"""
+
+
+def queue_capacity(conf, count_drafts=True):
+    """(上限, 使用中, 空き, 予約・下書きの一覧) を返す。上限はプランの scheduledPosts"""
+    orgs = buffer_call(GET_LIMITS)["account"]["organizations"]
+    limit = next(o["limits"]["scheduledPosts"] for o in orgs if o["id"] == conf["organization_id"])
+    queue = [e["node"] for e in buffer_call(GET_QUEUE % gql(conf["organization_id"]))["posts"]["edges"]]
+    used = sum(1 for n in queue if n["status"] == "scheduled" or (count_drafts and n["status"] == "draft"))
+    return limit, used, max(0, limit - used), queue
+
+
 def cmd_push(args):
+    """承認済み・未登録・未来日時の投稿を、予約枠の空きの数だけ、投稿日時が早い順に登録する。
+    入りきらなかった投稿は「承認」のまま残り、次に実行したときに登録される（水曜夜の追加登録）。"""
     bdir = brand_dir(args.brand)
     path = bdir / args.week
     posts = parse_week(path)
     errors, _ = check(bdir, posts)
     if any(errors.values()):
         sys.exit("validate でエラーがあるため送信しません。先に修正してください。")
-    targets = []
-    for p in sorted(approved(posts), key=lambda p: p["datetime"]):
-        if p.get("approved_hash") != text_hash(p["text"]):
-            sys.exit(f"{p['id']} は承認後に本文が変わっています（または approve コマンドで承認されていません）。"
-                     "review で確認し、approve で承認し直してください。")
-        targets.append(p)
-    if args.only:
-        targets = [p for p in targets if p["id"] in args.only]
-    if not targets:
-        sys.exit("送信対象（approve で承認済み）の投稿がありません。")
-
+    margin = load_schedule(bdir).get("past_margin_minutes", 15)
     ledger = load_ledger(bdir)
     done_ids = {r["投稿ID"] for r in ledger}
     done_hashes = {r["本文ハッシュ"] for r in ledger}
-    skipped = [p for p in targets if p["id"] in done_ids or text_hash(p["text"]) in done_hashes]
-    targets = [p for p in targets if p not in skipped]
-    for p in skipped:
-        print(f"スキップ {p['id']}: 登録記録.csv にすでに登録があります（重複登録の防止）")
+
+    targets, notes = [], []
+    for p in sorted(approved(posts), key=lambda p: p["datetime"]):
+        if args.only and p["id"] not in args.only:
+            continue
+        if p.get("approved_hash") != approval_hash(p):
+            notes.append(f"スキップ {p['id']}: 承認後に日時または本文が変わっています（または旧形式の承認です）。再承認が必要です")
+        elif is_past(p, margin):
+            notes.append(f"スキップ {p['id']}: 予定日時 {p['datetime']} が過去（または{margin}分以内）です")
+        elif p["id"] in done_ids or text_hash(p["text"]) in done_hashes:
+            notes.append(f"スキップ {p['id']}: 登録記録.csv にすでに登録があります（重複登録の防止）")
+        else:
+            targets.append(p)
+    for n in notes:
+        print(n)
     if not targets:
         print("新しく登録する投稿はありません。")
         return
 
     draft = args.mode == "draft"
     label = "下書き" if draft else "予約投稿"
+    conf = verify_channel(bdir)  # 毎回、投稿先が @expected_handle であることを確認する（読み取りのみ）
+    limit, used, free, queue = queue_capacity(conf, count_drafts=not args.ignore_drafts)
+    selected, waiting = targets[:free], targets[free:]
+    print(f"\n予約枠: 上限 {limit} / 使用中 {used}（下書きを{'含めない' if args.ignore_drafts else '含める'}）/ 空き {free}")
+    print(f"登録対象 {len(targets)}本 → 今回登録 {len(selected)}本、枠待ち {len(waiting)}本")
     if args.dry_run:
-        print(f"\n[dry-run] Bufferへ{label}として登録する予定の投稿: {len(targets)}本（送信しません）")
-        for p in targets:
-            print(f"  {p['datetime']} JST  {p['id']}  {re.sub(chr(10), ' ', p['text'])[:40]}…")
+        print(f"\n[dry-run] Bufferへ{label}として登録する予定（送信しません）")
+        for p in selected:
+            print(f"  登録  {p['datetime']} JST  {p['id']}  {re.sub(chr(10), ' ', p['text'])[:36]}…")
+        for p in waiting:
+            print(f"  枠待ち {p['datetime']} JST  {p['id']}")
         return
 
-    conf = verify_channel(bdir)  # 毎回、投稿先が @expected_handle であることを確認する
-    existing = {text_hash(n.get("text") or "") for n in fetch_posts(conf, ["scheduled", "draft"], 100)}
+    mine = [n for n in queue if n.get("channelId") == conf["channel_id"]]
+    existing = {text_hash(n.get("text") or "") for n in mine}
     results = []
-    for p in targets:
+    for p in selected:
         h = text_hash(p["text"])
+        if is_past(p, margin):  # 実行中に時間が過ぎた場合
+            results.append((p, "スキップ", "予定日時が過去になりました"))
+            continue
         if h in existing:
             results.append((p, "スキップ", "Bufferに同じ本文の投稿がすでにあります"))
             continue
@@ -484,6 +544,8 @@ def cmd_push(args):
     print(f"\n登録結果（{label}）")
     for p, r, d in results:
         print(f"  [{r}] {p['datetime']} JST  {p['id']}  {d}")
+    for p in waiting:
+        print(f"  [枠待ち] {p['datetime']} JST  {p['id']}  予約枠が空いたら、次回の実行で登録します")
     print("\n全登録履歴: python3 tools/x_tool.py results --brand", args.brand)
 
 
@@ -604,7 +666,10 @@ def main():
             p.add_argument("--mode", required=True, choices=("schedule", "draft"),
                            help="schedule=予約投稿 / draft=Bufferの下書き（必ずどちらかを指定）")
             p.add_argument("--only", nargs="+", help="送信する投稿IDを限定する")
-            p.add_argument("--dry-run", action="store_true", help="送信せず、送る予定の投稿を表示するだけ")
+            p.add_argument("--dry-run", action="store_true",
+                           help="送信せず、予約枠を確認して送る予定の投稿を表示するだけ（Bufferへの書き込みなし）")
+            p.add_argument("--ignore-drafts", action="store_true",
+                           help="Bufferの下書きを予約枠の使用数に含めない（既定は含める＝安全側）")
     for name in ("check", "posts", "history", "results", "report"):
         p = sub.add_parser(name)
         p.add_argument("--brand", required=True)

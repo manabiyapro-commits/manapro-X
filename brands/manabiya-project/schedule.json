@@ -1,0 +1,6 @@
+{
+  "slots": {"07:30": "朝", "20:00": "夜"},
+  "posts_per_week": 14,
+  "night_only_kinds": ["note紹介"],
+  "past_margin_minutes": 15
+}
