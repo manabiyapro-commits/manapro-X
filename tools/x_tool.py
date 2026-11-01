@@ -535,7 +535,8 @@ def cmd_push(args):
             print("失敗したため、残りの送信を中止します。")
             break
         post = res["post"]
-        set_fields(path, p["id"], status="登録済", buffer_id=post["id"], buffer_mode=label)
+        set_fields(path, p["id"], status="登録済", buffer_id=post["id"], buffer_mode=label,
+                   buffer_status=f"登録済（{dt.datetime.now(JST):%Y-%m-%d %H:%M}）")
         append_ledger(bdir, {"登録日時": dt.datetime.now(JST).strftime("%Y-%m-%d %H:%M"), "投稿ID": p["id"],
                              "予定日時(JST)": p["datetime"], "登録モード": label, "Buffer投稿ID": post["id"],
                              "Bufferの状態": post.get("status", ""), "本文ハッシュ": h, "本文": p["text"]})
