@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """X投稿 半自動化ツール（標準ライブラリのみ）
 
-使い方（x-posting/ で実行。W=週次/2026-W44.md）:
+使い方（リポジトリの直下で実行。W=週次/2026-W44.md）:
   python3 tools/x_tool.py check    --brand manabiya-project          # 接続確認と投稿先 @manabiyapro の確認
   python3 tools/x_tool.py posts    --brand manabiya-project          # Bufferの予約・下書き一覧
   python3 tools/x_tool.py validate --brand manabiya-project $W       # 投稿案のチェック

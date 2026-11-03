@@ -1,5 +1,5 @@
 """予約枠つき push の動作確認（ローカルの模擬 Buffer。実際の Buffer には接続しない）
-実行: python3 tests/test_push_mock.py（x-posting/ で）"""
+実行: python3 tests/test_push_mock.py（リポジトリの直下で）"""
 import datetime as dt, json, os, re, shutil, subprocess, sys, threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
