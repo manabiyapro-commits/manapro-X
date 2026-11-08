@@ -4,7 +4,9 @@
 投稿案の作成 → 人による承認 → Buffer への予約登録、までを扱います。
 
 もとは `manapro-site` リポジトリの `claude/note-writing-system` ブランチ（未マージ）の `x-posting/` で運用していたものを、
-変更履歴ごとこのリポジトリの直下に移しました。note 記事の取得・執筆の仕組みは移していません。
+変更履歴ごとこのリポジトリの直下に移しました。note 記事の取得・執筆の仕組みは、別リポジトリ
+[`manabiyapro-commits/manapro-note`](https://github.com/manabiyapro-commits/manapro-note) にあります。
+日曜の投稿案作成では、manapro-note のスタイルガイド・記事一覧・保存記事を読み取り専用で参照します（`/home/user/manapro-note` に置く）。
 
 ## 中身
 
