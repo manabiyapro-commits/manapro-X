@@ -239,8 +239,15 @@ def check(bdir, posts):
             errors[p.get("id", "?")].append(f"同じ日時（{p.get('datetime')}）に複数の投稿があります")
     kinds = Counter(p.get("kind") for p in posts if p.get("status") != "却下")
     total = sum(kinds.values())
-    if total and kinds["note紹介"] / total > 0.4:
-        warns["(週全体)"].append(f"note紹介が {kinds['note紹介']}/{total} 本です。宣伝の比率が高すぎないか確認してください")
+    # kindの付け間違いでも、掲載済み有料記事へのリンクは紹介として数える。
+    promotions = [p for p in live if p.get("kind") == "note紹介"
+                  or any(u in paid for u in re.findall(r"https?://\S+", p["text"]))]
+    if len(promotions) > 2:
+        for p in live:
+            errors[p.get("id", "?")].append(
+                f"有料note誘導は最大2本/週です（現在{len(promotions)}本）。原則1本にしてください")
+    elif len(promotions) == 2:
+        warns["(週全体)"].append("有料note誘導は2本です（原則1本、最大2本/週）")
     return errors, warns
 
 
