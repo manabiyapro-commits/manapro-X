@@ -221,7 +221,8 @@ def check(bdir, posts):
                 e.append("note紹介の投稿に記事URLがありません")
             elif paid and not any(u in paid for u in urls):
                 w.append("URLが有料記事リスト.md にありません")
-        for h in history:
+        # 登録済みの投稿は、投稿された自分自身と一致するので、過去投稿との照合から外す
+        for h in (history if p.get("status") != "登録済" else []):
             s = similarity(text, h.get("本文", ""))
             if s >= 0.6:
                 e.append(f"過去の投稿とほぼ同じです（類似度 {s:.2f}、{h.get('投稿日時', '')}）")
@@ -239,8 +240,9 @@ def check(bdir, posts):
             errors[p.get("id", "?")].append(f"同じ日時（{p.get('datetime')}）に複数の投稿があります")
     kinds = Counter(p.get("kind") for p in posts if p.get("status") != "却下")
     total = sum(kinds.values())
-    if total and kinds["note紹介"] / total > 0.4:
-        warns["(週全体)"].append(f"note紹介が {kinds['note紹介']}/{total} 本です。宣伝の比率が高すぎないか確認してください")
+    max_promo = load_schedule(bdir).get("max_note_promos_per_week", 2)
+    if kinds["note紹介"] > max_promo:
+        errors["(週全体)"].append(f"note紹介が {kinds['note紹介']} 本です。有料noteの紹介は週{max_promo}本までです")
     return errors, warns
 
 
@@ -261,6 +263,8 @@ def cmd_validate(args):
             print(f"    エラー: {m}")
         for m in warns.get(pid, []):
             print(f"    注意:   {m}")
+    for m in errors.get("(週全体)", []):
+        print(f"\nエラー: {m}")
     for m in warns.get("(週全体)", []):
         print(f"\n注意: {m}")
     n_err = sum(len(v) for v in errors.values())
@@ -483,18 +487,34 @@ def cmd_push(args):
     done_ids = {r["投稿ID"] for r in ledger}
     done_hashes = {r["本文ハッシュ"] for r in ledger}
 
-    targets, notes = [], []
+    targets, notes, late = [], [], []
     for p in sorted(approved(posts), key=lambda p: p["datetime"]):
         if args.only and p["id"] not in args.only:
             continue
         if p.get("approved_hash") != approval_hash(p):
             notes.append(f"スキップ {p['id']}: 承認後に日時または本文が変わっています（または旧形式の承認です）。再承認が必要です")
-        elif is_past(p, margin):
-            notes.append(f"スキップ {p['id']}: 予定日時 {p['datetime']} が過去（または{margin}分以内）です")
         elif p["id"] in done_ids or text_hash(p["text"]) in done_hashes:
             notes.append(f"スキップ {p['id']}: 登録記録.csv にすでに登録があります（重複登録の防止）")
+        elif is_past(p, margin):
+            if args.catch_up and parse_when(p) > dt.datetime.now(JST) - dt.timedelta(hours=args.catch_up_hours):
+                late.append(p)
+            else:
+                notes.append(f"スキップ {p['id']}: 予定日時 {p['datetime']} が過去（または{margin}分以内）です")
         else:
             targets.append(p)
+    # 遅延投稿（--catch-up）：予定時刻を過ぎた承認済み投稿を、いちばん近い空き時間に入れる。
+    # ほかの投稿の予定時刻から30分以上あけ、遅延投稿どうしは60分以上あける。週次ファイルの日時は変えない。
+    taken = [parse_when(p) for p in posts if parse_when(p) and p.get("status") != "却下"]
+    slot = dt.datetime.now(JST) + dt.timedelta(minutes=20)
+    slot = slot.replace(second=0, microsecond=0) + dt.timedelta(minutes=(-slot.minute) % 5)
+    for p in late:
+        while any(abs((slot - t).total_seconds()) < 1800 for t in taken):
+            slot += dt.timedelta(minutes=15)
+        p["_due"] = slot
+        taken.append(slot)
+        notes.append(f"遅延投稿 {p['id']}: 予定 {p['datetime']} を過ぎたため、{slot:%m/%d %H:%M} に投稿します")
+        slot += dt.timedelta(minutes=60)
+    targets = sorted(late + targets, key=lambda p: p.get("_due") or parse_when(p))
     for n in notes:
         print(n)
     if not targets:
@@ -511,7 +531,8 @@ def cmd_push(args):
     if args.dry_run:
         print(f"\n[dry-run] Bufferへ{label}として登録する予定（送信しません）")
         for p in selected:
-            print(f"  登録  {p['datetime']} JST  {p['id']}  {re.sub(chr(10), ' ', p['text'])[:36]}…")
+            when = p["_due"].strftime("%Y-%m-%d %H:%M") + "（遅延）" if p.get("_due") else p["datetime"]
+            print(f"  登録  {when} JST  {p['id']}  {re.sub(chr(10), ' ', p['text'])[:36]}…")
         for p in waiting:
             print(f"  枠待ち {p['datetime']} JST  {p['id']}")
         return
@@ -521,13 +542,14 @@ def cmd_push(args):
     results = []
     for p in selected:
         h = text_hash(p["text"])
-        if is_past(p, margin):  # 実行中に時間が過ぎた場合
+        when = p.get("_due") or parse_when(p)
+        if when < dt.datetime.now(JST) + dt.timedelta(minutes=5 if p.get("_due") else margin):  # 実行中に時間が過ぎた場合
             results.append((p, "スキップ", "予定日時が過去になりました"))
             continue
         if h in existing:
             results.append((p, "スキップ", "Bufferに同じ本文の投稿がすでにあります"))
             continue
-        due = parse_when(p).astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        due = when.astimezone(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
         q = CREATE_POST % (gql(p["text"]), gql(conf["channel_id"]), gql(due), "true" if draft else "false")
         res = buffer_call(q)["createPost"]
         if res.get("message") or not res.get("post"):
@@ -535,16 +557,18 @@ def cmd_push(args):
             print("失敗したため、残りの送信を中止します。")
             break
         post = res["post"]
+        late_note = f"、遅延投稿：{when:%Y-%m-%d %H:%M} に投稿" if p.get("_due") else ""
         set_fields(path, p["id"], status="登録済", buffer_id=post["id"], buffer_mode=label,
-                   buffer_status=f"登録済（{dt.datetime.now(JST):%Y-%m-%d %H:%M}）")
+                   buffer_status=f"登録済（{dt.datetime.now(JST):%Y-%m-%d %H:%M}{late_note}）")
         append_ledger(bdir, {"登録日時": dt.datetime.now(JST).strftime("%Y-%m-%d %H:%M"), "投稿ID": p["id"],
-                             "予定日時(JST)": p["datetime"], "登録モード": label, "Buffer投稿ID": post["id"],
+                             "予定日時(JST)": when.strftime("%Y-%m-%d %H:%M"), "登録モード": label, "Buffer投稿ID": post["id"],
                              "Bufferの状態": post.get("status", ""), "本文ハッシュ": h, "本文": p["text"]})
         existing.add(h)
         results.append((p, "成功", f"Buffer id={post['id']} 状態={post.get('status')}"))
     print(f"\n登録結果（{label}）")
     for p, r, d in results:
-        print(f"  [{r}] {p['datetime']} JST  {p['id']}  {d}")
+        shown = p["_due"].strftime("%Y-%m-%d %H:%M") + "（遅延）" if p.get("_due") else p["datetime"]
+        print(f"  [{r}] {shown} JST  {p['id']}  {d}")
     for p in waiting:
         print(f"  [枠待ち] {p['datetime']} JST  {p['id']}  予約枠が空いたら、次回の実行で登録します")
     print("\n全登録履歴: python3 tools/x_tool.py results --brand", args.brand)
@@ -669,6 +693,10 @@ def main():
             p.add_argument("--only", nargs="+", help="送信する投稿IDを限定する")
             p.add_argument("--dry-run", action="store_true",
                            help="送信せず、予約枠を確認して送る予定の投稿を表示するだけ（Bufferへの書き込みなし）")
+            p.add_argument("--catch-up", action="store_true",
+                           help="予定時刻を過ぎた承認済み・未登録の投稿を、いちばん近い空き時間に登録する（ユーザーの指示があるときだけ使う）")
+            p.add_argument("--catch-up-hours", type=float, default=24,
+                           help="--catch-up で対象にする、予定時刻からの経過時間の上限（既定24時間）")
             p.add_argument("--ignore-drafts", action="store_true",
                            help="Bufferの下書きを予約枠の使用数に含めない（既定は含める＝安全側）")
     for name in ("check", "posts", "history", "results", "report"):

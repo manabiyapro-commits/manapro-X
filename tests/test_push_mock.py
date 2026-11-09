@@ -154,6 +154,32 @@ expect("TEST-1" not in ids, "過去日時の投稿は登録されない")
 now_utc = dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%dT%H:%M")
 expect(all(c["dueAt"] > now_utc for c in creates[n0:]), "登録されたのは未来日時の投稿だけ")
 
+print("## 8. --catch-up：予定時刻を過ぎた承認済み投稿を、近い空き時間に登録する")
+fresh(); n0 = len(creates)
+now = dt.datetime.now(JST)
+recent = now.replace(hour=7, minute=30) if now.hour * 60 + now.minute > 7 * 60 + 50 else (now - dt.timedelta(days=1)).replace(hour=20, minute=0)
+(T / W).write_text((T / W).read_text().replace(f"- datetime: {slot(1)}", f"- datetime: {recent:%Y-%m-%d %H:%M}", 1))
+pp = {x["id"]: x for x in t.parse_week(T / W)}["TEST-1"]
+t.set_fields(T / W, "TEST-1", approved_hash=t.approval_hash(pp))
+run("push", "--brand", "_t", W, "--mode", "schedule", "--catch-up")
+late = [c for c in creates[n0:] if c["text"] == TEXTS[0]]
+expect(len(late) == 1, "予定時刻を過ぎた投稿が1回だけ登録された")
+soon = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=10)).strftime("%Y-%m-%dT%H:%M")
+expect(bool(late) and late[0]["dueAt"] > soon, "遅延投稿の日時は、今から少し先の時刻になっている")
+st = {p["id"]: p for p in t.parse_week(T / W)}
+expect("遅延投稿" in st["TEST-1"].get("buffer_status", ""), "週次ファイルに遅延投稿であることが記録される")
+expect(st["TEST-1"]["datetime"] == f"{recent:%Y-%m-%d %H:%M}", "週次ファイルの予定日時は書き換えない")
+
+print("## 9. 登録済みの投稿は、投稿された自分自身と重複扱いにならない／未登録の同じ本文はエラー")
+fresh()
+hist = T / "分析" / "過去投稿.csv"
+hist.parent.mkdir(exist_ok=True)
+hist.write_text("投稿日時(JST),本文\n2026-01-01 07:30," + TEXTS[0] + "\n", encoding="utf-8-sig")
+t.set_fields(T / W, "TEST-1", status="登録済")
+expect(run("validate", "--brand", "_t", W) == 0, "登録済みの TEST-1 はエラーにならない")
+hist.write_text("投稿日時(JST),本文\n2026-01-01 07:30," + TEXTS[2] + "\n", encoding="utf-8-sig")
+expect(run("validate", "--brand", "_t", W) == 1, "未登録の TEST-3 は過去の投稿と同じ本文としてエラーになる")
+
 shutil.rmtree(T)
 print("\n結果:", "すべて成功" if ok else "失敗あり")
 sys.exit(0 if ok else 1)
