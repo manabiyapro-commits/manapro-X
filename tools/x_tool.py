@@ -480,8 +480,8 @@ def cmd_push(args):
     path = bdir / args.week
     posts = parse_week(path)
     errors, _ = check(bdir, posts)
-    if any(errors.values()):
-        sys.exit("validate でエラーがあるため送信しません。先に修正してください。")
+    if errors.get("(週全体)"):
+        sys.exit("週全体のエラーがあるため送信しません：" + "; ".join(errors["(週全体)"]))
     margin = load_schedule(bdir).get("past_margin_minutes", 15)
     ledger = load_ledger(bdir)
     done_ids = {r["投稿ID"] for r in ledger}
@@ -491,7 +491,10 @@ def cmd_push(args):
     for p in sorted(approved(posts), key=lambda p: p["datetime"]):
         if args.only and p["id"] not in args.only:
             continue
-        if p.get("approved_hash") != approval_hash(p):
+        if errors.get(p["id"]):
+            # エラーのある投稿だけを外し、ほかの投稿の登録は続ける
+            notes.append(f"スキップ {p['id']}: validate のエラー（{'; '.join(errors[p['id']])}）。本文を直して再承認が必要です")
+        elif p.get("approved_hash") != approval_hash(p):
             notes.append(f"スキップ {p['id']}: 承認後に日時または本文が変わっています（または旧形式の承認です）。再承認が必要です")
         elif p["id"] in done_ids or text_hash(p["text"]) in done_hashes:
             notes.append(f"スキップ {p['id']}: 登録記録.csv にすでに登録があります（重複登録の防止）")

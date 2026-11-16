@@ -180,6 +180,17 @@ expect(run("validate", "--brand", "_t", W) == 0, "登録済みの TEST-1 はエ�
 hist.write_text("投稿日時(JST),本文\n2026-01-01 07:30," + TEXTS[2] + "\n", encoding="utf-8-sig")
 expect(run("validate", "--brand", "_t", W) == 1, "未登録の TEST-3 は過去の投稿と同じ本文としてエラーになる")
 
+print("## 10. エラーのある投稿（文字数オーバー）だけ外し、ほかは登録する")
+fresh(); n0 = len(creates)
+long_text = "長" * 150
+(T / W).write_text((T / W).read_text().replace(TEXTS[2], long_text, 1))
+pp = {x["id"]: x for x in t.parse_week(T / W)}["TEST-3"]
+t.set_fields(T / W, "TEST-3", approved_hash=t.approval_hash(pp))
+run("push", "--brand", "_t", W, "--mode", "schedule")
+ids = [r["投稿ID"] for r in t.load_ledger(T)]
+expect("TEST-3" not in ids, "文字数オーバーの TEST-3 は登録されない")
+expect(len(creates) - n0 == 9, f"ほかの承認済み投稿は登録される（{len(creates) - n0}本）")
+
 shutil.rmtree(T)
 print("\n結果:", "すべて成功" if ok else "失敗あり")
 sys.exit(0 if ok else 1)
