@@ -191,6 +191,20 @@ ids = [r["投稿ID"] for r in t.load_ledger(T)]
 expect("TEST-3" not in ids, "文字数オーバーの TEST-3 は登録されない")
 expect(len(creates) - n0 == 9, f"ほかの承認済み投稿は登録される（{len(creates) - n0}本）")
 
+print("## 11. 予定日時を過ぎた未承認の投稿も承認できる（内容の承認）が、通常の登録では Buffer に送らない")
+fresh(); n0 = len(creates)
+past = (dt.datetime.now(JST) - dt.timedelta(days=2)).replace(hour=20, minute=0)
+(T / W).write_text((T / W).read_text().replace(f"- datetime: {slot(2)}", f"- datetime: {past:%Y-%m-%d %H:%M}", 1))
+expect(run("validate", "--brand", "_t", W) == 0, "過去日時の未承認投稿は、警告だけでエラーにならない")
+run("approve", "--brand", "_t", W, "TEST-2")
+pp = {x["id"]: x for x in t.parse_week(T / W)}["TEST-2"]
+expect(pp.get("status") == "承認" and pp.get("approved_hash") == t.approval_hash(pp), "過去日時の投稿に承認と approved_hash が記録される")
+run("push", "--brand", "_t", W, "--mode", "schedule")
+expect(not [c for c in creates[n0:] if c["text"] == TEXTS[1]], "通常の push では、過去日時の承認済み投稿は登録されない")
+expect(len(creates) - n0 == 9, f"ほかの承認済み投稿は通常どおり登録される（{len(creates) - n0}本）")
+run("push", "--brand", "_t", W, "--mode", "schedule", "--catch-up")
+expect(not [c for c in creates[n0:] if c["text"] == TEXTS[1]], "24時間を過ぎた投稿は --catch-up でも登録されない")
+
 shutil.rmtree(T)
 print("\n結果:", "すべて成功" if ok else "失敗あり")
 sys.exit(0 if ok else 1)
