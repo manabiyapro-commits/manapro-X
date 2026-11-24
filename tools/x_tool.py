@@ -195,10 +195,11 @@ def check(bdir, posts):
         if not when:
             e.append("datetime は「YYYY-MM-DD HH:MM」（日本時間）で書いてください")
         else:
-            if is_past(p, margin) and p.get("status") == "未承認":
-                e.append(f"予定日時が過去（または{margin}分以内）です。日時を直してください")
-            elif is_past(p, margin) and p.get("status") == "承認":
-                w.append(f"予定日時が過去（または{margin}分以内）のため、Bufferには登録されません")
+            # 内容の承認と、Bufferに登録できるかは分けて扱う。予定日時が過去でも承認（内容の確定）はできる。
+            # 過去の投稿は push で自動的にスキップされ、登録されるのは --catch-up を指示したとき（24時間以内）だけ。
+            if is_past(p, margin) and p.get("status") in ("未承認", "承認"):
+                w.append(f"予定日時が過去（または{margin}分以内）のため、通常の登録では Buffer に登録されません"
+                         "（承認はできます。遅延投稿は指示があるときだけ push --catch-up で、予定時刻から24時間以内）")
             hhmm = when.strftime("%H:%M")
             if slots and hhmm not in slots:
                 e.append(f"投稿時刻 {hhmm} は投稿枠（{'・'.join(slots)}）にありません")
