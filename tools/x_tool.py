@@ -37,7 +37,7 @@ ROOT = Path(__file__).resolve().parent.parent
 JST = dt.timezone(dt.timedelta(hours=9))
 BUFFER_ENDPOINT = "https://api.buffer.com"
 STATUSES = ("未承認", "承認", "却下", "登録済")
-KINDS = ("情報提供", "note紹介")
+KINDS = ("問題", "解答", "note紹介", "情報提供")  # 情報提供は W48 までの旧形式
 
 # 誇張・虚偽につながりやすい表現（見つかったら警告。根拠があれば本文で示す）
 RISKY = ["必ず合格", "絶対", "100%", "１００％", "確実に", "誰でも", "簡単に合格", "最短で合格",
@@ -178,6 +178,7 @@ def check(bdir, posts):
     slots = sched.get("slots", {})  # {"07:30": "朝", "20:00": "夜"}
     margin = sched.get("past_margin_minutes", 15)
     seen_ids = Counter(p.get("id") for p in posts)
+    by_id = {p.get("id"): p for p in posts}
     for p in posts:
         pid = p.get("id") or f"(行{p['line']})"
         e, w = errors[pid], warns[pid]
@@ -203,8 +204,8 @@ def check(bdir, posts):
             hhmm = when.strftime("%H:%M")
             if slots and hhmm not in slots:
                 e.append(f"投稿時刻 {hhmm} は投稿枠（{'・'.join(slots)}）にありません")
-            elif slots and p.get("kind") in sched.get("night_only_kinds", []) and slots.get(hhmm) != "夜":
-                w.append(f"{p.get('kind')} は夜の枠に入れる方針です")
+            elif p.get("status") != "登録済" and hhmm not in sched.get("kind_slots", {}).get(p.get("kind"), [hhmm]):
+                e.append(f"{p.get('kind')} の投稿時刻は {'・'.join(sched['kind_slots'][p['kind']])} です（{hhmm} になっています）")
         text = p["text"]
         if not text:
             e.append("本文が空です")
@@ -222,16 +223,23 @@ def check(bdir, posts):
                 e.append("note紹介の投稿に記事URLがありません")
             elif paid and not any(u in paid for u in urls):
                 w.append("URLが有料記事リスト.md にありません")
-        # 登録済みの投稿は、投稿された自分自身と一致するので、過去投稿との照合から外す
+        # 登録済みの投稿は、投稿された自分自身と一致するので、過去投稿との照合から外す。
+        # 解答の投稿は、すでに投稿された自分の問題とは似ていて当然なので、その問題とは照合しない
+        own_q = by_id.get(p.get("answer_for"), {}).get("text", "") if p.get("kind") == "解答" else ""
         for h in (history if p.get("status") != "登録済" else []):
+            if own_q and similarity(own_q, h.get("本文", "")) >= 0.9:
+                continue
             s = similarity(text, h.get("本文", ""))
             if s >= 0.6:
                 e.append(f"過去の投稿とほぼ同じです（類似度 {s:.2f}、{h.get('投稿日時', '')}）")
             elif s >= 0.4:
                 w.append(f"過去の投稿と似ています（類似度 {s:.2f}、{h.get('投稿日時', '')}）")
     live = [p for p in posts if p.get("status") != "却下"]
+    check_pairs(posts, sched, errors)
     for i, a in enumerate(live):
         for b in live[i + 1:]:
+            if pair_of(a) == b.get("id") or pair_of(b) == a.get("id"):
+                continue  # 問題と、その解答は似ていて当然
             s = similarity(a["text"], b["text"])
             if s >= 0.5:
                 errors[a.get("id", "?")].append(f"{b.get('id')} と内容がほぼ同じです（類似度 {s:.2f}）")
@@ -241,7 +249,9 @@ def check(bdir, posts):
             errors[p.get("id", "?")].append(f"同じ日時（{p.get('datetime')}）に複数の投稿があります")
     kinds = Counter(p.get("kind") for p in posts if p.get("status") != "却下")
     total = sum(kinds.values())
-    max_promo = load_schedule(bdir).get("max_note_promos_per_week", 2)
+    max_promo = sched.get("max_note_promos_per_week", 2)
+    if kinds["情報提供"]:  # W48 までの旧形式の週は、当時の上限（週2本）で確認する
+        max_promo = max(max_promo, 2)
     if kinds["note紹介"] > max_promo:
         errors["(週全体)"].append(f"note紹介が {kinds['note紹介']} 本です。有料noteの紹介は週{max_promo}本までです")
     return errors, warns
@@ -271,6 +281,44 @@ def cmd_validate(args):
     n_err = sum(len(v) for v in errors.values())
     print(f"\nエラー {n_err}件 / 注意 {sum(len(v) for v in warns.values())}件")
     return n_err
+
+
+def pair_of(p):
+    """解答の投稿なら、対応する問題のID"""
+    return p.get("answer_for") if p.get("kind") == "解答" else None
+
+
+def check_pairs(posts, sched, errors):
+    """問題と解答の組を確かめる：解答は同じ週の問題を answer_for で指し、決まった時刻（朝の問題→12:00、夜の問題→21:00）に置く。
+    問題には解答が1本だけある。片方だけ却下・片方だけの投稿は、問題だけ・解答だけが投稿されてしまうのでエラーにする"""
+    by_id = {p.get("id"): p for p in posts}
+    times = sched.get("answer_times", {})
+    answers = defaultdict(list)
+    for a in posts:
+        if a.get("kind") != "解答":
+            continue
+        q = by_id.get(a.get("answer_for"))
+        if not a.get("answer_for"):
+            errors[a.get("id", "?")].append("解答の投稿には answer_for（対応する問題のID）を書いてください")
+        elif not q or q.get("kind") != "問題":
+            errors[a.get("id", "?")].append(f"answer_for の {a.get('answer_for')} は、この週の「問題」の投稿ではありません")
+        else:
+            answers[q["id"]].append(a)
+            if (q.get("status") == "却下") != (a.get("status") == "却下"):
+                errors[a.get("id", "?")].append(f"問題 {q['id']} と解答の片方だけが却下されています（両方そろえてください）")
+            qw, aw = parse_when(q), parse_when(a)
+            if qw and aw:
+                want = times.get(qw.strftime("%H:%M"))
+                if want and (aw.date() != qw.date() or aw.strftime("%H:%M") != want):
+                    errors[a.get("id", "?")].append(f"解答の日時は、問題 {q['id']}（{q['datetime']}）と同じ日の {want} にしてください")
+                elif aw <= qw:
+                    errors[a.get("id", "?")].append(f"解答の日時が、問題 {q['id']} より前になっています")
+    for q in posts:
+        if q.get("kind") != "問題" or q.get("status") == "却下":
+            continue
+        n = len([a for a in answers[q.get("id")] if a.get("status") != "却下"])
+        if n != 1:
+            errors[q.get("id", "?")].append("この問題の解答の投稿がありません" if n == 0 else f"この問題の解答が {n} 本あります（1本にしてください）")
 
 
 def approved(posts):
@@ -506,6 +554,26 @@ def cmd_push(args):
                 notes.append(f"スキップ {p['id']}: 予定日時 {p['datetime']} が過去（または{margin}分以内）です")
         else:
             targets.append(p)
+    # 問題と解答は組で扱う：片方だけが投稿されないよう、もう片方が登録済みか、今回いっしょに登録できるときだけ登録する
+    registered = done_ids | {x["id"] for x in posts if x.get("status") == "登録済"}
+    answer_of = {pair_of(x): x for x in posts if pair_of(x) and x.get("status") != "却下"}
+    while True:
+        cand = {x["id"] for x in targets + late}
+        drop = []
+        for x in targets + late:
+            if x.get("kind") == "問題":
+                a = answer_of.get(x["id"])
+                if not a or (a["id"] not in cand and a["id"] not in registered):
+                    drop.append((x, f"解答 {a['id'] if a else '(なし)'} が登録できる状態ではありません（未承認・予定日時が過去など）。問題だけが投稿されないよう、そろってから登録します"))
+            elif pair_of(x) and pair_of(x) not in cand and pair_of(x) not in registered:
+                drop.append((x, f"問題 {pair_of(x)} が登録されていません。解答だけが投稿されないよう、登録しません"))
+        if not drop:
+            break
+        for x, why in drop:
+            notes.append(f"スキップ {x['id']}: {why}")
+        gone = {x["id"] for x, _ in drop}
+        targets = [x for x in targets if x["id"] not in gone]
+        late = [x for x in late if x["id"] not in gone]
     # 遅延投稿（--catch-up）：予定時刻を過ぎた承認済み投稿を、いちばん近い空き時間に入れる。
     # ほかの投稿の予定時刻から30分以上あけ、遅延投稿どうしは60分以上あける。週次ファイルの日時は変えない。
     taken = [parse_when(p) for p in posts if parse_when(p) and p.get("status") != "却下"]
@@ -518,6 +586,15 @@ def cmd_push(args):
         taken.append(slot)
         notes.append(f"遅延投稿 {p['id']}: 予定 {p['datetime']} を過ぎたため、{slot:%m/%d %H:%M} に投稿します")
         slot += dt.timedelta(minutes=60)
+        # 遅延した問題の解答は、問題より60分以上あとにする（もとの予定時刻のほうが遅ければ、そのまま）
+        a = answer_of.get(p["id"])
+        if a and a in targets and parse_when(a) < p["_due"] + dt.timedelta(minutes=60):
+            while any(abs((slot - t).total_seconds()) < 1800 for t in taken):
+                slot += dt.timedelta(minutes=15)
+            a["_due"] = slot
+            taken.append(slot)
+            notes.append(f"遅延投稿 {a['id']}: 問題 {p['id']} が遅れたため、解答を {slot:%m/%d %H:%M} に投稿します")
+            slot += dt.timedelta(minutes=60)
     targets = sorted(late + targets, key=lambda p: p.get("_due") or parse_when(p))
     for n in notes:
         print(n)
@@ -529,7 +606,20 @@ def cmd_push(args):
     label = "下書き" if draft else "予約投稿"
     conf = verify_channel(bdir)  # 毎回、投稿先が @expected_handle であることを確認する（読み取りのみ）
     limit, used, free, queue = queue_capacity(conf, count_drafts=not args.ignore_drafts)
-    selected, waiting = targets[:free], targets[free:]
+    # 早い順に、空きの数だけ選ぶ。問題は解答とひと組（2枠）で選び、入りきらなければ以降はすべて枠待ちにする
+    selected, waiting, left, full, taken_ids = [], [], free, False, set()
+    for p in targets:
+        if p["id"] in taken_ids:
+            continue
+        unit = [p] + [a for a in targets if p.get("kind") == "問題" and pair_of(a) == p["id"]]
+        taken_ids |= {u["id"] for u in unit}
+        if not full and len(unit) <= left:
+            selected += unit
+            left -= len(unit)
+        else:
+            full = True
+            waiting += unit
+    selected.sort(key=lambda p: p.get("_due") or parse_when(p))
     print(f"\n予約枠: 上限 {limit} / 使用中 {used}（下書きを{'含めない' if args.ignore_drafts else '含める'}）/ 空き {free}")
     print(f"登録対象 {len(targets)}本 → 今回登録 {len(selected)}本、枠待ち {len(waiting)}本")
     if args.dry_run:
@@ -543,8 +633,12 @@ def cmd_push(args):
 
     mine = [n for n in queue if n.get("channelId") == conf["channel_id"]]
     existing = {text_hash(n.get("text") or "") for n in mine}
-    results = []
+    results, not_sent = [], set()
     for p in selected:
+        if pair_of(p) in not_sent:
+            results.append((p, "スキップ", f"問題 {pair_of(p)} を登録できなかったため、解答も登録しません"))
+            continue
+        not_sent.add(p["id"])  # 成功したら外す
         h = text_hash(p["text"])
         when = p.get("_due") or parse_when(p)
         if when < dt.datetime.now(JST) + dt.timedelta(minutes=5 if p.get("_due") else margin):  # 実行中に時間が過ぎた場合
@@ -568,6 +662,7 @@ def cmd_push(args):
                              "予定日時(JST)": when.strftime("%Y-%m-%d %H:%M"), "登録モード": label, "Buffer投稿ID": post["id"],
                              "Bufferの状態": post.get("status", ""), "本文ハッシュ": h, "本文": p["text"]})
         existing.add(h)
+        not_sent.discard(p["id"])
         results.append((p, "成功", f"Buffer id={post['id']} 状態={post.get('status')}"))
     print(f"\n登録結果（{label}）")
     for p, r, d in results:
