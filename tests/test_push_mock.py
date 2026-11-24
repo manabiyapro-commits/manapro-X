@@ -205,6 +205,77 @@ expect(len(creates) - n0 == 9, f"ほかの承認済み投稿は通常どおり�
 run("push", "--brand", "_t", W, "--mode", "schedule", "--catch-up")
 expect(not [c for c in creates[n0:] if c["text"] == TEXTS[1]], "24時間を過ぎた投稿は --catch-up でも登録されない")
 
+print("## 12. 問題と解答（朝 7:30→12:00、夜 20:00→21:00）は組で登録する")
+QW = "週次/クイズ.md"
+QT = ["教育基本法の第1条は何を定めていますか", "第1条の正解は教育の目的です。人格の完成を目指します",
+      "ピアジェの発達段階の三番目はどれでしょう", "正解は具体的操作期。保存の概念が身につく時期です",
+      "学校教育法で校長の職務を定めた条文は何条か", "正解は第37条。校務をつかさどり所属職員を監督します",
+      "マズローの欲求階層で最も高い段階を答えよう", "正解は自己実現の欲求。潜在能力を発揮したい欲求です"]
+def quiz_week(day=None, approve_ids=None):
+    day = day or MON
+    lines = ["# クイズ週"]
+    for i in range(8):
+        d = day + dt.timedelta(days=i // 4)
+        hhmm = ["07:30", "12:00", "20:00", "21:00"][i % 4]
+        lines += ["", f"## Q{i + 1}", f"- id: Q-{i + 1}", f"- datetime: {d:%Y-%m-%d} {hhmm}",
+                  f"- kind: {'問題' if i % 2 == 0 else '解答'}", "- theme: テスト", "- status: 未承認"]
+        if i % 2:
+            lines.append(f"- answer_for: Q-{i}")
+        lines += ["```text", QT[i], "```"]
+    (T / QW).write_text("\n".join(lines) + "\n", encoding="utf-8")
+    for p in t.parse_week(T / QW):
+        if approve_ids is None or p["id"] in approve_ids:
+            t.set_fields(T / QW, p["id"], status="承認", approved_hash=t.approval_hash(p))
+
+fresh(); quiz_week()
+expect(run("validate", "--brand", "_t", QW) == 0, "問題と解答の組が正しければエラーにならない")
+src = (T / QW).read_text()
+(T / QW).write_text(src.replace(f"{MON:%Y-%m-%d} 12:00", f"{MON:%Y-%m-%d} 21:30", 1))
+expect(run("validate", "--brand", "_t", QW) == 1, "朝の問題の解答が 12:00 以外ならエラー")
+(T / QW).write_text(src.replace("- answer_for: Q-1\n", "", 1))
+expect(run("validate", "--brand", "_t", QW) == 1, "answer_for がない解答・解答のない問題はエラー")
+
+fresh(); n0 = len(creates); quiz_week()
+run("push", "--brand", "_t", QW, "--mode", "schedule")
+got = [c["text"] for c in creates[n0:]]
+expect(len(got) == 8 and got == QT, f"8本が、問題→解答の順に登録された（{len(got)}本）")
+
+fresh(); n0 = len(creates); quiz_week(approve_ids={"Q-1", "Q-3", "Q-4", "Q-5", "Q-6", "Q-7", "Q-8"})
+run("push", "--brand", "_t", QW, "--mode", "schedule")
+got = [c["text"] for c in creates[n0:]]
+expect(QT[0] not in got, "解答が未承認の問題は、問題だけが登録されることはない")
+expect(len(got) == 6, f"ほかの3組（6本）は登録される（{len(got)}本）")
+
+fresh(); n0 = len(creates); quiz_week()
+queue += [{"id": f"s{i}", "status": "scheduled", "dueAt": None, "text": f"既存{i}", "channelId": "chX"} for i in range(6)]
+run("push", "--brand", "_t", QW, "--mode", "schedule")  # 空き 3 → 1組（2本）だけ。組を分けない
+got = [c["text"] for c in creates[n0:]]
+expect(got == QT[:2], f"空きが3でも、組を分けずに1組（2本）だけ登録する（{len(got)}本）")
+for n in queue:
+    if n["status"] == "scheduled":
+        n["status"] = "sent"
+run("push", "--brand", "_t", QW, "--mode", "schedule")
+got = [c["text"] for c in creates[n0:]]
+expect(sorted(got) == sorted(QT), "枠が空くと、残りの組が登録される（重複なし）")
+
+print("## 13. --catch-up：遅れた問題の解答は、問題より60分以上あとになる")
+fresh(); n0 = len(creates)
+now = dt.datetime.now(JST)
+qday = (now - dt.timedelta(hours=1)).replace(second=0, microsecond=0)
+lines = ["# 遅延", "", "## A", "- id: L-1", f"- datetime: {qday:%Y-%m-%d %H:%M}", "- kind: 問題", "- status: 未承認",
+         "```text", QT[0], "```", "", "## B", "- id: L-2", f"- datetime: {qday + dt.timedelta(minutes=90):%Y-%m-%d %H:%M}",
+         "- kind: 解答", "- answer_for: L-1", "- status: 未承認", "```text", QT[1], "```"]
+(T / QW).write_text("\n".join(lines) + "\n", encoding="utf-8")
+(T / "schedule.json").write_text(json.dumps({"past_margin_minutes": 15}))  # 時刻の枠の確認は外す（任意の時刻で試す）
+for p in t.parse_week(T / QW):
+    t.set_fields(T / QW, p["id"], status="承認", approved_hash=t.approval_hash(p))
+run("push", "--brand", "_t", QW, "--mode", "schedule", "--catch-up")
+cs = {c["text"]: c["dueAt"] for c in creates[n0:]}
+expect(QT[0] in cs and QT[1] in cs, "遅れた問題と、その解答が登録された")
+if QT[0] in cs and QT[1] in cs:
+    gap = (dt.datetime.fromisoformat(cs[QT[1]].replace("Z", "+00:00")) - dt.datetime.fromisoformat(cs[QT[0]].replace("Z", "+00:00")))
+    expect(gap >= dt.timedelta(minutes=60), f"解答は問題の {gap} 後（60分以上）")
+
 shutil.rmtree(T)
 print("\n結果:", "すべて成功" if ok else "失敗あり")
 sys.exit(0 if ok else 1)
